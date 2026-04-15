@@ -75,18 +75,24 @@ export default function leap(initialConcurrency, globalOptions = {}) {
     const abortListeners = new Map();
     const workerWaitingQueue = [];
     const scheduledRateLimitChecks = new Set();
+    const delayTimers = new Set();
+    const delayedTaskDatas = new Set();
+    const deadLetterQueue = [];
+    const runningTasksMap = new Map();
 
     let currentLoad = 0;
     let activeCount = 0;
+    let delayedCount = 0;
     let currentConcurrency = concurrency;
     let isDraining = false;
     let isPaused = false;
     let seqCounter = 0;
-    let idleResolver = null;
+    let idleResolvers = [];
+    let emptyResolvers = [];
+    let sizeLimitResolvers = [];
+    let errorResolvers = [];
     let errorsInCycle = [];
     let latencies = [];
-    let minPriority = Infinity;
-    let maxPriority = -Infinity;
     let priorityTracker = { min: Infinity, max: -Infinity, count: 0 };
 
     const config = {
@@ -108,12 +114,14 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       maxQueueSize: options.maxQueueSize ?? 10000,
       adaptiveLatencyLow: options.adaptiveLatencyLow ?? 50,
       adaptiveLatencyHigh: options.adaptiveLatencyHigh ?? 200,
+      maxDlqSize: options.maxDlqSize ?? 1000,
     };
 
     const metrics = {
       totalTasks: 0,
       successfulTasks: 0,
       failedTasks: 0,
+      dlqCount: 0,
       startTime: Date.now(),
       allLatencies: [],
       latencyLock: false,
@@ -121,12 +129,12 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         const elapsedSec = (Date.now() - this.startTime) / 1000;
         return elapsedSec > 0
           ? (this.successfulTasks / elapsedSec).toFixed(2)
-          : 0;
+          : "0.00";
       },
       get errorRate() {
         return this.totalTasks > 0
           ? (this.failedTasks / this.totalTasks).toFixed(4)
-          : 0;
+          : "0.0000";
       },
       get percentiles() {
         this.latencyLock = true;
@@ -154,6 +162,27 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         });
       }
       return circuitBreakers.get(key);
+    };
+
+    const pushToDlq = (taskData, error, attempts) => {
+      const entry = {
+        id: taskData.id ?? null,
+        type: taskData.type ?? null,
+        priority: taskData.priority,
+        error,
+        errorMessage: error?.message ?? String(error),
+        attempts,
+        failedAt: Date.now(),
+        metadata: taskData.metadata ?? null,
+        tags: taskData.tags ?? [],
+      };
+      deadLetterQueue.push(entry);
+      if (deadLetterQueue.length > config.maxDlqSize) {
+        deadLetterQueue.shift();
+      }
+      metrics.dlqCount++;
+      emit("task:dlq", entry);
+      options.onDlq?.(entry);
     };
 
     const maintenanceInterval = setInterval(() => {
@@ -239,7 +268,10 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
       latencies = [];
 
-      if (avg < config.adaptiveLatencyLow && currentConcurrency < config.maxC) {
+      if (
+        avg < config.adaptiveLatencyLow &&
+        currentConcurrency < config.maxC
+      ) {
         currentConcurrency++;
         emit("concurrency:adjust", {
           concurrency: currentConcurrency,
@@ -346,6 +378,39 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       }
     };
 
+    const isQueueEmpty = () =>
+      queue.size() === 0 && batchBuffers.size === 0 && delayedCount === 0;
+
+    const resolveEmpty = () => {
+      if (emptyResolvers.length === 0) return;
+      const resolvers = emptyResolvers;
+      emptyResolvers = [];
+      for (const r of resolvers) r();
+    };
+
+    const checkSizeLimitResolvers = () => {
+      if (sizeLimitResolvers.length === 0) return;
+      const pending =
+        queue.size() +
+        Array.from(blockedTasks.values()).reduce((a, t) => a + t.length, 0) +
+        Array.from(batchBuffers.values()).reduce((a, t) => a + t.length, 0) +
+        delayedCount;
+      sizeLimitResolvers = sizeLimitResolvers.filter(({ limit, resolve }) => {
+        if (pending < limit) {
+          resolve();
+          return false;
+        }
+        return true;
+      });
+    };
+
+    const notifyError = (err) => {
+      if (errorResolvers.length === 0) return;
+      const resolvers = errorResolvers;
+      errorResolvers = [];
+      for (const reject of resolvers) reject(err);
+    };
+
     const executeTask = async (taskData) => {
       const {
         task,
@@ -370,6 +435,12 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       currentLoad += taskData.weight || 1;
       taskData.isActive = true;
       activeCount++;
+      runningTasksMap.set(taskData, {
+        id: taskData.id ?? null,
+        priority: taskData.priority,
+        startTime: Date.now(),
+        timeout: taskData.timeout ?? undefined,
+      });
       beforeExecute?.(taskData);
 
       const startTime = Date.now();
@@ -467,6 +538,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
             memoryDelta: memDelta,
             status: "success",
           });
+          runningTasksMap.delete(taskData);
           resolve(result);
           return;
         } catch (err) {
@@ -486,6 +558,10 @@ export default function leap(initialConcurrency, globalOptions = {}) {
                 breaker.openUntil = Date.now() + config.circuitResetTimeout;
                 emit("circuit:open", { type: type || "default" });
               }
+
+              if (maxRetries > 0) {
+                pushToDlq(taskData, err, retries);
+              }
             }
 
             metrics.failedTasks++;
@@ -499,6 +575,8 @@ export default function leap(initialConcurrency, globalOptions = {}) {
               status: "failure",
               error: err.message,
             });
+            notifyError(err);
+            runningTasksMap.delete(taskData);
             reject(err);
             return;
           }
@@ -508,6 +586,12 @@ export default function leap(initialConcurrency, globalOptions = {}) {
               Math.pow(config.retryFactor, retries - 1),
             config.maxRetryDelay
           );
+          emit("task:retry", {
+            id: taskData.id,
+            attempt: retries,
+            delay,
+            error: lastError?.message,
+          });
           await new Promise((r) => setTimeout(r, delay));
         }
       }
@@ -554,24 +638,33 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       }
     };
 
+    const resolveIdle = () => {
+      const resolvers = idleResolvers;
+      const errors = errorsInCycle;
+      idleResolvers = [];
+      errorsInCycle = [];
+      for (const r of resolvers) {
+        r({ errors, failed: errors.length > 0, metrics });
+      }
+    };
+
+    const isIdle = () =>
+      activeCount === 0 &&
+      queue.size() === 0 &&
+      blockedTasks.size === 0 &&
+      batchBuffers.size === 0 &&
+      delayedCount === 0;
+
     const next = () => {
-      if (isPaused || isDraining) return;
+      if (isPaused || isDraining) {
+        if (isDraining && isIdle() && idleResolvers.length > 0) resolveIdle();
+        return;
+      }
 
       if (queue.size() === 0) {
-        if (
-          activeCount === 0 &&
-          blockedTasks.size === 0 &&
-          batchBuffers.size === 0 &&
-          idleResolver
-        ) {
-          idleResolver({
-            errors: errorsInCycle,
-            failed: errorsInCycle.length > 0,
-            metrics,
-          });
-          idleResolver = null;
-          errorsInCycle = [];
-        }
+        if (isQueueEmpty()) resolveEmpty();
+        checkSizeLimitResolvers();
+        if (isIdle() && idleResolvers.length > 0) resolveIdle();
         return;
       }
 
@@ -602,6 +695,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           currentLoad -= taskData.weight || 1;
           taskData.isActive = false;
           activeCount--;
+          runningTasksMap.delete(taskData);
 
           if (taskData.id) {
             completedTasks.set(taskData.id, Date.now());
@@ -618,9 +712,37 @@ export default function leap(initialConcurrency, globalOptions = {}) {
             pendingCache.delete(taskData.cacheKey);
           }
 
+          checkSizeLimitResolvers();
           adjustConcurrency();
           next();
         });
+      }
+
+      if (isQueueEmpty()) resolveEmpty();
+      checkSizeLimitResolvers();
+    };
+
+    const enqueueTaskData = (taskData, opts) => {
+      if (opts.batchKey) {
+        if (!batchBuffers.has(opts.batchKey))
+          batchBuffers.set(opts.batchKey, []);
+        const buffer = batchBuffers.get(opts.batchKey);
+        buffer.push(taskData);
+
+        if (buffer.length >= config.batchSize) {
+          flushBatch(opts.batchKey);
+        } else if (!batchTimers.has(opts.batchKey)) {
+          const timerId = setTimeout(() => {
+            flushBatch(opts.batchKey);
+          }, config.batchTimeout);
+          batchTimers.set(opts.batchKey, timerId);
+        }
+      } else if (taskData.dependsOn.length > 0) {
+        checkDependencies(taskData);
+      } else {
+        queue.push(taskData);
+        updatePriorityOnPush(taskData.priority);
+        next();
       }
     };
 
@@ -647,8 +769,9 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         return Promise.reject(new Error("Queue is full"));
       }
 
+      let taskData;
       const taskPromise = new Promise((resolve, reject) => {
-        const taskData = {
+        taskData = {
           task,
           resolve,
           reject,
@@ -671,49 +794,32 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           abortListeners.set(taskData, abortHandler);
         }
 
-        if (opts.batchKey) {
-          if (!batchBuffers.has(opts.batchKey))
-            batchBuffers.set(opts.batchKey, []);
-          const buffer = batchBuffers.get(opts.batchKey);
-          buffer.push(taskData);
-
-          if (buffer.length >= config.batchSize) {
-            flushBatch(opts.batchKey);
-          } else if (!batchTimers.has(opts.batchKey)) {
-            const timerId = setTimeout(() => {
-              flushBatch(opts.batchKey);
-            }, config.batchTimeout);
-            batchTimers.set(opts.batchKey, timerId);
-          }
-        } else if (taskData.dependsOn.length > 0) {
-          checkDependencies(taskData);
+        if (opts.delay && opts.delay > 0) {
+          delayedCount++;
+          delayedTaskDatas.add(taskData);
+          const timerId = setTimeout(() => {
+            delayTimers.delete(timerId);
+            delayedTaskDatas.delete(taskData);
+            delayedCount--;
+            enqueueTaskData(taskData, opts);
+          }, opts.delay);
+          delayTimers.add(timerId);
         } else {
-          queue.push(taskData);
-          updatePriorityOnPush(taskData.priority);
-          next();
+          enqueueTaskData(taskData, opts);
         }
       });
 
       taskPromise.catch(() => {
-        const opts =
-          typeof options === "number" ? { priority: options } : options || {};
-
-        const taskData = Array.from(abortListeners.keys()).find(
-          (t) => t.task === task
-        );
-
-        if (taskData) {
-          const handler = abortListeners.get(taskData);
-          if (handler && taskData.signal) {
-            taskData.signal.removeEventListener("abort", handler);
-          }
+        const handler = abortListeners.get(taskData);
+        if (handler && taskData?.signal) {
+          taskData.signal.removeEventListener("abort", handler);
           abortListeners.delete(taskData);
         }
 
         if (opts.batchKey) {
           const buffer = batchBuffers.get(opts.batchKey);
           if (buffer) {
-            const filtered = buffer.filter((t) => t.task !== task);
+            const filtered = buffer.filter((t) => t !== taskData);
             if (filtered.length === 0) {
               batchBuffers.delete(opts.batchKey);
               const timer = batchTimers.get(opts.batchKey);
@@ -744,18 +850,36 @@ export default function leap(initialConcurrency, globalOptions = {}) {
     };
     poolInstance.onIdle = () => {
       for (const key of batchBuffers.keys()) flushBatch(key);
-      return new Promise((r) =>
-        activeCount === 0 &&
-        queue.size() === 0 &&
-        blockedTasks.size === 0 &&
-        batchBuffers.size === 0
-          ? r({ errors: [], failed: false, metrics })
-          : (idleResolver = r)
-      );
+      if (isIdle()) {
+        return Promise.resolve({ errors: [], failed: false, metrics });
+      }
+      return new Promise((r) => {
+        idleResolvers.push(r);
+      });
     };
     poolInstance.drain = () => {
       isDraining = true;
-      return poolInstance.onIdle();
+      return poolInstance.onIdle().then((result) => {
+        isDraining = false;
+        return result;
+      });
+    };
+
+    poolInstance.onEmpty = () => {
+      for (const key of batchBuffers.keys()) flushBatch(key);
+      if (isQueueEmpty()) return Promise.resolve();
+      return new Promise((r) => emptyResolvers.push(r));
+    };
+
+    poolInstance.onSizeLessThan = (limit) => {
+      if (poolInstance.pendingCount < limit) return Promise.resolve();
+      return new Promise((r) =>
+        sizeLimitResolvers.push({ limit, resolve: r })
+      );
+    };
+
+    poolInstance.onError = () => {
+      return new Promise((_, reject) => errorResolvers.push(reject));
     };
 
     poolInstance.cancel = (query) => {
@@ -874,10 +998,42 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       return result;
     };
 
+    poolInstance.setPriority = (id, priority) => {
+      const task = queue.heap.find((t) => t.id === id);
+      if (!task) return false;
+      task.priority = priority;
+      queue._rebuild();
+      rebuildPriorityTracker();
+      return true;
+    };
+
+    poolInstance.sizeBy = (options = {}) => {
+      return queue.heap.filter((task) => {
+        if (
+          options.priority !== undefined &&
+          task.priority !== options.priority
+        )
+          return false;
+        if (options.type !== undefined && task.type !== options.type)
+          return false;
+        if (options.tag !== undefined && !task.tags?.includes(options.tag))
+          return false;
+        return true;
+      }).length;
+    };
+
     poolInstance.clear = async () => {
       clearInterval(maintenanceInterval);
       rateLimitTimers.forEach(clearTimeout);
       rateLimitTimers.clear();
+
+      delayTimers.forEach(clearTimeout);
+      delayTimers.clear();
+      for (const taskData of delayedTaskDatas) {
+        taskData.reject(new Error("Pool cleared"));
+      }
+      delayedTaskDatas.clear();
+      delayedCount = 0;
 
       const queuedTasks = [...queue.heap];
       queue.clear();
@@ -909,6 +1065,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       completedTasks.clear();
       pendingCache.clear();
       circuitBreakers.clear();
+      runningTasksMap.clear();
 
       for (const [task, handler] of abortListeners.entries()) {
         if (task.signal) {
@@ -916,6 +1073,17 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         }
       }
       abortListeners.clear();
+
+      emptyResolvers = [];
+      sizeLimitResolvers = [];
+      errorResolvers = [];
+
+      const resolvers = idleResolvers;
+      idleResolvers = [];
+      for (const r of resolvers) {
+        r({ errors: errorsInCycle, failed: errorsInCycle.length > 0, metrics });
+      }
+      errorsInCycle = [];
 
       const terminationPromises = workerPool.map((w) => terminateWorker(w));
       await Promise.allSettled(terminationPromises);
@@ -960,6 +1128,84 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       }));
     };
 
+    poolInstance.exportMetrics = (format = "json") => {
+      const m = metrics;
+      const p = m.percentiles;
+      const pending = poolInstance.pendingCount;
+
+      if (format === "prometheus") {
+        const lines = [
+          `# HELP smart_pool_total_tasks_total Total number of tasks processed`,
+          `# TYPE smart_pool_total_tasks_total counter`,
+          `smart_pool_total_tasks_total ${m.totalTasks}`,
+          `# HELP smart_pool_successful_tasks_total Total successful tasks`,
+          `# TYPE smart_pool_successful_tasks_total counter`,
+          `smart_pool_successful_tasks_total ${m.successfulTasks}`,
+          `# HELP smart_pool_failed_tasks_total Total failed tasks`,
+          `# TYPE smart_pool_failed_tasks_total counter`,
+          `smart_pool_failed_tasks_total ${m.failedTasks}`,
+          `# HELP smart_pool_dlq_tasks_total Total tasks sent to dead-letter queue`,
+          `# TYPE smart_pool_dlq_tasks_total counter`,
+          `smart_pool_dlq_tasks_total ${m.dlqCount}`,
+          `# HELP smart_pool_active_tasks Currently executing tasks`,
+          `# TYPE smart_pool_active_tasks gauge`,
+          `smart_pool_active_tasks ${activeCount}`,
+          `# HELP smart_pool_pending_tasks Tasks waiting in queue (includes delayed and blocked)`,
+          `# TYPE smart_pool_pending_tasks gauge`,
+          `smart_pool_pending_tasks ${pending}`,
+          `# HELP smart_pool_concurrency_limit Current maximum concurrency`,
+          `# TYPE smart_pool_concurrency_limit gauge`,
+          `smart_pool_concurrency_limit ${currentConcurrency}`,
+          `# HELP smart_pool_current_load Aggregate weight of active tasks`,
+          `# TYPE smart_pool_current_load gauge`,
+          `smart_pool_current_load ${currentLoad}`,
+          `# HELP smart_pool_dlq_size Current dead-letter queue depth`,
+          `# TYPE smart_pool_dlq_size gauge`,
+          `smart_pool_dlq_size ${deadLetterQueue.length}`,
+          `# HELP smart_pool_latency_p50_milliseconds 50th percentile task latency`,
+          `# TYPE smart_pool_latency_p50_milliseconds gauge`,
+          `smart_pool_latency_p50_milliseconds ${p.p50}`,
+          `# HELP smart_pool_latency_p90_milliseconds 90th percentile task latency`,
+          `# TYPE smart_pool_latency_p90_milliseconds gauge`,
+          `smart_pool_latency_p90_milliseconds ${p.p90}`,
+          `# HELP smart_pool_latency_p99_milliseconds 99th percentile task latency`,
+          `# TYPE smart_pool_latency_p99_milliseconds gauge`,
+          `smart_pool_latency_p99_milliseconds ${p.p99}`,
+        ];
+        return lines.join("\n");
+      }
+
+      return {
+        totalTasks: m.totalTasks,
+        successfulTasks: m.successfulTasks,
+        failedTasks: m.failedTasks,
+        dlqCount: m.dlqCount,
+        activeCount,
+        pendingCount: pending,
+        concurrency: currentConcurrency,
+        currentLoad,
+        throughput: m.throughput,
+        errorRate: m.errorRate,
+        percentiles: p,
+        dlqSize: deadLetterQueue.length,
+        uptime: Date.now() - m.startTime,
+      };
+    };
+
+    poolInstance.clearDlq = () => {
+      deadLetterQueue.length = 0;
+    };
+
+    poolInstance.resetMetrics = () => {
+      metrics.totalTasks = 0;
+      metrics.successfulTasks = 0;
+      metrics.failedTasks = 0;
+      metrics.dlqCount = 0;
+      metrics.startTime = Date.now();
+      metrics.allLatencies = [];
+      errorsInCycle = [];
+    };
+
     Object.defineProperties(poolInstance, {
       activeCount: { get: () => activeCount },
       pendingCount: {
@@ -972,7 +1218,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
             (acc, tasks) => acc + tasks.length,
             0
           );
-          return queue.size() + blockedCount + batchCount;
+          return queue.size() + blockedCount + batchCount + delayedCount;
         },
       },
       currentLoad: { get: () => currentLoad },
@@ -980,6 +1226,15 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       isDraining: { get: () => isDraining },
       isPaused: { get: () => isPaused },
       metrics: { get: () => metrics },
+      dlq: { get: () => [...deadLetterQueue] },
+      isSaturated: {
+        get: () =>
+          activeCount >= currentConcurrency &&
+          (queue.size() > 0 || batchBuffers.size > 0),
+      },
+      runningTasks: {
+        get: () => Array.from(runningTasksMap.values()),
+      },
     });
 
     return poolInstance;

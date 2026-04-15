@@ -1,6 +1,6 @@
 {
-  "name": "smart-queue",
-  "version": "1.0.0",
+  "name": "smart-pool",
+  "version": "1.2.0",
   "type": "module",
   "description": "High-performance priority promise pool with concurrency control",
   "author": "Marcus Johnson",
@@ -41,6 +41,10 @@
     "backoff",
     "adaptive-concurrency",
     "throttling",
+    "dead-letter-queue",
+    "delayed-jobs",
+    "prometheus",
+    "observability",
     "node-js"
   ]
 }
